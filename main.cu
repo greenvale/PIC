@@ -3,11 +3,8 @@
 #include <memory>
 #include <fstream>
 
-#include "fluid.hpp"
 #include "utility.cuh"
 #include "fluid.cuh"
-
-#define CUDA 1
 
 int main(int argc, char *argv[])
 {
@@ -16,47 +13,42 @@ int main(int argc, char *argv[])
     pos_os.open("pos.csv", std::ios::trunc);
     dns_os.open("dns.csv", std::ios::trunc);
 
-    auto config = std::make_shared<Config>();
+    double vmin, vmax, xdelta, vdelta;
+    size_t nv;
+
+    auto config = std::make_shared<FluidConfig>();
     config->Lx = 1.0;
     config->ncells = 1<<5;
-    config->npts = 1<<20;
+    config->np = 1<<10;
     config->dt = 0.001;
     config->mass = 1.;
-
-#if (CUDA==1)
     
-    Fluid fluidCPU(config);
-    cudaFluid fluidGPU(config);
+    vmin = -0.5;
+    vmax = 0.5;
+    xdelta = 0.2;
+    vdelta = 0.1;
+    nv = config->ncells;
+    auto pmf = perturbed_pmf(config->ncells, nv, 0., config->Lx, vmin, vmax, xdelta, vdelta);
 
-    fluidCPU.update_mmts();
-    fluidGPU.update_mmts();
-    fluidGPU.device2host();
+    Fluid fluid;
+    fluid.init_config(config);
 
-    print_row(dns_os, config->nfaces, fluidCPU.m_dens_h);
-    print_row(dns_os, config->nfaces, fluidGPU.m_dens_h);
+    fluid.allocate("h", "ppos");
+    fluid.allocate("h", "pvel");
     
-#else
-    std::cout << "Running on CPU\n";
-    Fluid fluid(config);
+    fluid.init_particles_cpu(pmf, nv, vmin, vmax);
 
-    int print_freq = 100;
+    fluid.allocate("d", "ppos");
+    fluid.allocate("d", "pvel");
 
-    for (int k = 0; k < 10000; ++k)
-    {
-        fluid.update_mmts();
-        fluid.update_forces();
-        fluid.push_pts();
+    fluid.copy("h2d", "ppos");
+    fluid.copy("h2d", "pvel");
 
-        if (k % print_freq == 0)
-        {
-            std::cout << "Printed @ k =" << k << "\n";
-            //print_row(pos_os, config->npts, fluid.m_ppos);
-            print_row(dns_os, config->nfaces, fluid.m_dens_h);
-        }
-    }
+    //fluid.memory_dump("d", "ppos");
     
+    fluid.memory_summary();
+
     pos_os.close();
     dns_os.close();
-#endif
 
 }
