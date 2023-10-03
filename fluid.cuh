@@ -12,8 +12,10 @@
 #include <set>
 #include <sstream>
 #include <iomanip>
+#include <stdexcept>
 #include "math.h"
-#include "utility.cuh"
+#include "../utils/utility.cuh"
+#include "../utils/storage.cuh"
 
 std::vector<double> perturbed_pmf(int nx, int nv, double xmin, double xmax, double vmin, double vmax, double xdelta, double vdelta)
 {
@@ -37,6 +39,15 @@ std::vector<double> perturbed_pmf(int nx, int nv, double xmin, double xmax, doub
     return pmf;
 }
 
+// distribution data for fluid (taking position and velocity)
+struct Distribution
+{
+    double xmin, xmax, vmin, vmax;
+    size_t nx, nv;
+    std::vector<double> pmf;
+};
+
+// declare fluid class to make friend of fluid config
 class Fluid;
 
 class FluidConfig
@@ -49,181 +60,217 @@ public:
     double dt;
     double mass;
     double charge;
-private:
-    double dx;
-    double weight;
-    size_t nfaces;
     void complete()
     {
+        if (completed == true)
+        {
+            throw std::runtime_error("config has already been completed and configured");
+        }
+        assert(completed == false);
         dx = Lx / ncells;
         nfaces = ncells + 1;
         weight = 1.0 / np;
+        completed = true;
     }
+private:
+    bool completed = false;
+    double dx;
+    double weight;
+    size_t nfaces;
 };
 
 class Fluid
 {
 public:
-    Fluid();
+    Fluid() = delete;
+    Fluid(const FluidConfig &config);
     ~Fluid();
 
     Fluid(Fluid &rhs) = delete;
     void operator=(const Fluid &rhs) = delete;
 
-    void init_config(const std::shared_ptr<FluidConfig> &config);
-    void init_particles_cpu(const std::vector<double> &pmf, int nv, double vmin, double vmax);
+    void init_particles_h(const Distribution &dist);
     
     double shape1(const double &x1, const double &x2);
+    double LHSface(const int &idx);
+    double RHSface(const int &idx);
+    double centre(const int &idx);
+    int pos2idx(const double &pos);
 
-    void update_momts_cpu();
-    void update_fields_cpu();
-    void push_particles_cpu();
+    void update_momts_h();
+    void update_fields_h();
+    void push_particles_h();
 
-    void update_momts_gpu();
-    void update_fields_gpu();
-    void update_particles_gpu();
-
-    // memory management functions
-    void allocate(std::string owner, std::string var);
-    void destroy(std::string owner, std::string var, bool throw_err);
-    void copy(std::string path, std::string var);
-    void memory_dump(std::string owner, std::string var);
-    void memory_summary();
+    void update_momts_d();
+    void update_fields_d();
+    void push_particles_d();
 
 public:
-    std::shared_ptr<FluidConfig> m_config;
-    static const std::vector<std::string> m_moment_names;
-    static const std::vector<std::string> m_field_names;
-    static const std::vector<std::string> m_storage_type_names;
+    FluidConfig m_config;
 
-    std::unordered_map<std::string, std::unordered_map<std::string, double*>> m_storage;
-    std::unordered_map<std::string, std::string> m_storage_types;
-    std::unordered_map<std::string, size_t> m_storage_sizes;
-    std::set<std::string> m_vars;
+    Storage<double> m_dens;
+    Storage<double> m_pres;
+    Storage<double> m_ppos;
+    Storage<double> m_pvel;
 };
 
-const std::vector<std::string> Fluid::m_moment_names =  {"dens"};
-const std::vector<std::string> Fluid::m_field_names = {"presr"};
-const std::vector<std::string> Fluid::m_storage_type_names = {"ptcl", "cell"};
-
-Fluid::Fluid()
+Fluid::Fluid(const FluidConfig &config) :
+    m_config(config),
+    m_dens(Storage<double>(config.nfaces)),
+    m_pres(Storage<double>(config.nfaces)),
+    m_ppos(Storage<double>(config.np)),
+    m_pvel(Storage<double>(config.np))
 {
-    m_storage["h"]["ppos"] = nullptr;
-    m_storage["h"]["pvel"] = nullptr;
-    m_storage["d"]["ppos"] = nullptr;
-    m_storage["d"]["pvel"] = nullptr;
-    m_storage_types["ppos"] = "ptcl";
-    m_storage_types["pvel"] = "ptcl";
-    
-    for (auto &n : m_moment_names)
+    if (config.completed == false)
     {
-        m_storage["h"][n] = nullptr;
-        m_storage["d"][n] = nullptr;
-        m_storage_types[n] = "cell";
-    }
-    for (auto &n : m_field_names)
-    {
-        m_storage["h"][n] = nullptr;
-        m_storage["d"][n] = nullptr;
-        m_storage_types[n] = "cell";
-    }
-    
-    // store all variables in a set
-    for (auto &pair : m_storage["h"])
-    {
-        m_vars.insert(pair.first);
+        throw std::runtime_error("fluid config must be completed before initialisation");
     }
 }
 
 Fluid::~Fluid()
 {
-    for (auto &pair : m_storage["h"])
-    {
-        destroy("h", pair.first, false);
-    }
-    for (auto &pair : m_storage["d"])
-    {
-        destroy("d", pair.first, false);
-    }
-    std::cout << "Destruction complete\n";
+    
 }
 
-void Fluid::init_config(const std::shared_ptr<FluidConfig> &config)
+void Fluid::init_particles_h(const Distribution &dist)
 {
-    m_config = config;
-    m_config->complete();
-    m_storage_sizes["ptcl"] = m_config->np;
-    m_storage_sizes["cell"] = m_config->nfaces;
-}
+    double *ppos_ptr = m_ppos.hptr();
+    double *pvel_ptr = m_pvel.hptr();
 
-void Fluid::init_particles_cpu(const std::vector<double> &pmf, int nv, double vmin, double vmax)
-{
-    double *ppos_ptr = m_storage["h"]["ppos"];
-    double *pvel_ptr = m_storage["h"]["pvel"];
-    if (ppos_ptr == nullptr || pvel_ptr == nullptr)
-    {
-        std::cerr << "ppos and/or ppvel not initialised on h\n";
-        exit(1);
-    }
-
-    double dv = (vmax - vmin)/nv;
-    double sum = std::accumulate(pmf.cbegin(), pmf.cend(), 0.);
+    double dv = (dist.vmax - dist.vmin) / double(dist.nv);
+    double sum = std::accumulate(dist.pmf.cbegin(), dist.pmf.cend(), 0.);
     int pidx = 0;
-    for (int i = 0; i < m_config->ncells; ++i)
+    for (int i = 0; i < m_config.ncells; ++i)
     {
-        for (int j = 0; j < nv; ++j)
+        for (int j = 0; j < dist.nv; ++j)
         {
-            int target = std::floor(m_config->np * pmf[i*nv + j] / sum);
+            int target = std::floor(m_config.np * dist.pmf[i*dist.nv + j] / sum);
             for (int k = 0; k < target; ++k)
             {
-                double uniform_rand1 = std::rand() / double(RAND_MAX);
-                double uniform_rand2 = std::rand() / double(RAND_MAX);
-                ppos_ptr[pidx] = (i + uniform_rand1) * m_config->dx;
-                pvel_ptr[pidx] = vmin + (j + uniform_rand2) * dv;
+                double uniform_rand1 = double(std::rand()) / double(RAND_MAX);
+                double uniform_rand2 = double(std::rand()) / double(RAND_MAX);
+                *(ppos_ptr) = (i + uniform_rand1) * m_config.dx;
+                *(pvel_ptr) = dist.vmin + (j + uniform_rand2) * dv;
+                ppos_ptr++;
+                pvel_ptr++;
                 ++pidx;
             }
         }
     }
     // allocate surplus particles randomly within the domain
-    for ( ; pidx < m_config->np; ++pidx)
+    for ( ; pidx < m_config.np; ++pidx)
     {
-        int i = std::rand() % m_config->ncells;
-        int j = std::rand() % nv;
-        double uniform_rand1 = std::rand() / double(RAND_MAX);
-        double uniform_rand2 = std::rand() / double(RAND_MAX);
-        ppos_ptr[pidx] = (i + uniform_rand1) * m_config->dx;
-        ppos_ptr[pidx] = vmin + (j + uniform_rand2) * dv;
+        int i = std::rand() % m_config.ncells;
+        int j = std::rand() % dist.nv;
+        double uniform_rand1 = double(std::rand()) / double(RAND_MAX);
+        double uniform_rand2 = double(std::rand()) / double(RAND_MAX);
+        *(ppos_ptr) = (i + uniform_rand1) * m_config.dx;
+        *(pvel_ptr) = dist.vmin + (j + uniform_rand2) * dv;
+        ppos_ptr++;
+        pvel_ptr++;
     }
 }
 
 inline double Fluid::shape1(const double &x1, const double &x2)
 {
-    double result = 1.0 - std::abs(x1 - x2)/m_config->dx;
+    double result = 1.0 - std::abs(x1 - x2)/m_config.dx;
     result = std::max(0., result);
     return result;
 }
 
-// accumulates movments
-void Fluid::update_momts_cpu()
+inline double Fluid::LHSface(const int &idx)
 {
-    double *dens_ptr = m_storage["h"]["dens"];
-    double *ppos_ptr = m_storage["h"]["ppos"];
+    return m_config.dx * idx;
+}
+
+inline double Fluid::RHSface(const int &idx)
+{
+    return m_config.dx * (idx + 1);
+}
+
+inline double Fluid::centre(const int &idx)
+{
+    return m_config.dx * (idx + 0.5);
+}
+
+inline int Fluid::pos2idx(const double &pos)
+{
+    return std::floor(pos / m_config.dx);
+}
+
+// accumulates movments
+void Fluid::update_momts_h()
+{
+    double *dens_ptr = m_dens.hptr();
+    double *ppos_ptr = m_ppos.hptr();
 
     // set density to be zero
-    std::fill(dens_ptr, dens_ptr + m_config->nfaces, 0.);
+    std::fill(dens_ptr, dens_ptr + m_config.nfaces, 0.);
 
-    for (int idx = 0; idx < m_config->np; ++idx)
+    for (int idx = 0; idx < m_config.np; ++idx)
     {
-        int cidx = std::floor(ppos_ptr[idx] / m_config->dx);
+        int cidx = std::floor(ppos_ptr[idx] / m_config.dx);
         
-        dens_ptr[cidx]   += m_config->weight * shape1(ppos_ptr[idx], m_config->dx*cidx) / m_config->dx;
-        dens_ptr[cidx+1] += m_config->weight * shape1(ppos_ptr[idx], m_config->dx*(cidx+1)) / m_config->dx;
+        dens_ptr[cidx]   += m_config.weight * shape1(ppos_ptr[idx], m_config.dx*cidx) / m_config.dx;
+        dens_ptr[cidx+1] += m_config.weight * shape1(ppos_ptr[idx], m_config.dx*(cidx+1)) / m_config.dx;
     }
 }
 
-void Fluid::update_fields_cpu()
+void Fluid::update_fields_h()
 {
+    double *dens_ptr = m_dens.hptr();
+    double *pres_ptr = m_pres.hptr();
 
+    double alpha = 0.1;
+
+    // calculate force on boundaries first
+    pres_ptr[0] = -alpha * (dens_ptr[1] - dens_ptr[m_config.ncells - 1]) / (2*m_config.dx); 
+    pres_ptr[m_config.ncells] = pres_ptr[0];
+
+    // calculate force on inner faces
+    for (int idx = 1; idx < m_config.ncells - 1; ++idx)
+    {
+        pres_ptr[idx] = -alpha * (dens_ptr[idx+1] - dens_ptr[idx-1]) / (2*m_config.dx);
+    }
+}
+
+void Fluid::push_particles_h()
+{
+    double *ppos_ptr = m_ppos.hptr();
+    double *pvel_ptr = m_pvel.hptr();
+    double *dens_ptr = m_dens.hptr();
+    double *pres_ptr = m_pres.hptr();
+
+    double dpos, dvel, accel, shapeLHS, shapeRHS;
+    int cidx;
+
+    for (int pidx = 0; pidx < m_config.np; ++pidx)
+    {
+        // get cell index given particle position
+        cidx = pos2idx(ppos_ptr[pidx]);
+
+        // calculate shapes for lhs/rhs cell faces
+        shapeLHS = shape1(LHSface(cidx), ppos_ptr[pidx]);
+        shapeRHS = shape1(RHSface(cidx), ppos_ptr[pidx]);
+
+        // calculate acceleration and change in vel and pos
+        accel = (shapeLHS*pres_ptr[cidx] + shapeRHS*pres_ptr[cidx+1]) / m_config.mass;
+        dvel = accel * m_config.dt;
+        dpos = pvel_ptr[pidx]*m_config.dt + 0.5*accel*m_config.dt*m_config.dt;
+
+        ppos_ptr[pidx] += dpos;
+        pvel_ptr[pidx] += dvel;
+
+        // enforce periodic boundary conditions
+        while (ppos_ptr[pidx] < 0.)
+        {
+            ppos_ptr[pidx] += m_config.Lx;
+        }
+        while (ppos_ptr[pidx] >= m_config.Lx)
+        {
+            ppos_ptr[pidx] -= m_config.Lx;
+        }
+    } 
 }
 
 __device__ double shape1_d(const double &dx, const double &x1, const double &x2)
@@ -242,137 +289,17 @@ __global__ void kern_accm_momts(int np, double dx, double weight, double *dens, 
     }
 }
 
-/* Memory management functions */
-
-void Fluid::allocate(std::string owner, std::string var)
+void Fluid::update_momts_d()
 {
-    if (m_storage[owner][var] == nullptr)
-    {
-        size_t size = m_storage_sizes[m_storage_types[var]];
-        if (owner == "h")
-        {
-            m_storage[owner][var] = (double*)malloc(size * sizeof(double));
-        }
-        else if (owner == "d")
-        {
-            double *ptr;
-            checkCudaError(cudaMalloc((void**) &ptr, size));
-            m_storage[owner][var] = ptr; 
-        }
-    }
-    else
-    {
-        std::cerr << "Failed to allocate " << var << " to " << owner << "\n";
-        exit(1);
-    }
+
 }
 
-void Fluid::destroy(std::string owner, std::string var, bool throw_err = true)
+void Fluid::update_fields_d()
 {
-    if (m_storage[owner][var] != nullptr)
-    {
-        if (owner == "h")
-        {
-            free(m_storage[owner][var]);
-        }
-        else
-        {
-            checkCudaError(cudaFree(m_storage[owner][var]));
-        }
-        m_storage[owner][var] = nullptr;
-    }
-    else if (throw_err)
-    {
-        std::cerr << "Failed to free " << var << " on " << owner << "\n";
-        exit(1);
-    }
+
 }
 
-void Fluid::copy(std::string path, std::string var)
+void Fluid::push_particles_d()
 {
-    if (m_storage["h"][var] != nullptr && m_storage["d"][var] != nullptr)
-    {
-        size_t size = m_storage_sizes[m_storage_types[var]];
-        cudaMemcpyKind memcpyKind;
-        if (path == "h2d")
-        {
-            memcpyKind = cudaMemcpyHostToDevice;
-        }
-        else if (path == "d2h")
-        {
-            memcpyKind = cudaMemcpyDeviceToHost;
-        }
-        else
-        {
-            std::cerr << "Invalid copy path provided\n";
-            exit(1);
-        }
-
-        double *dest = m_storage[path.substr(2,1)][var];
-        double *src  = m_storage[path.substr(0,1)][var];
-
-        checkCudaError(cudaMemcpy((void*)dest, (void*)src, size*sizeof(double), memcpyKind));
-    }
-    else
-    {
-        std::cerr << "Failed to copy " << var << " from " << path[0] << " to " << path[2] << "\n";
-        exit(1);
-    }
-}
-
-__global__ void kern_memory_dump(size_t size, double *ptr)
-{
-    for (size_t i = 0; i < size; ++i)
-    {
-        ptr[i] = 1.0 * i;
-        printf("%lu, %f\n", i, ptr[i]);
-    }
-}
-
-void Fluid::memory_dump(std::string owner, std::string var)
-{
-    double *ptr = m_storage[owner][var];
-    if (ptr != nullptr)
-    {    
-        std::cout << "Memory dump BEGIN: " << var << " on " << owner << "\n";
-        if (owner == "h")
-        {
-            for (size_t i = 0; i < m_storage_sizes[m_storage_types[var]]; ++i)
-            {
-                std::cout << i << ", " << ptr[i] << "\n";
-            }
-        }
-        else if (owner == "d")
-        {
-            kern_memory_dump<<<1, 1>>>(m_storage_sizes[m_storage_types[var]], m_storage[owner][var]);
-            checkCudaError(cudaDeviceSynchronize());
-        }
-        std::cout << "Memory dump END\n";
-    }
-    else
-    {
-        std::cerr << "Memory dump failed : " << var << " is not allocated on " << owner << "\n";
-    }
-}
-
-void Fluid::memory_summary()
-{
-    size_t col_width = 20;
-
-    std::cout << std::setw(col_width) << "Var";
-    std::cout << std::setw(col_width) << "Size";
-    std::cout << std::setw(col_width) << "Host"; 
-    std::cout << std::setw(col_width) << "Device\n";
-    for (int i = 0; i < 40; ++i)
-        std::cout << "--";
-    std::cout << "\n";
-
-    for (auto &v : m_vars)
-    {   
-        std::cout << std::setw(col_width) << v;
-        std::cout << std::setw(col_width) << m_storage_sizes[m_storage_types[v]];
-        std::cout << std::setw(col_width) << ptr2str(m_storage["h"][v]);
-        std::cout << std::setw(col_width) << ptr2str(m_storage["d"][v]);
-        std::cout << "\n\n";
-    }
+    
 }
