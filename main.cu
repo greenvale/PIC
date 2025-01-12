@@ -9,6 +9,9 @@
 #include <cstdlib>
 #include <algorithm>
 
+// particle push kernel
+// uses explicit method to calculate new position
+// velocity simply grows exponentially, no dependence on density
 __global__ void push(double *x0, double *x1, double *v0, double *v1, int N, double dt) {
     
     int i = threadIdx.x + blockDim.x * blockIdx.x;
@@ -20,6 +23,7 @@ __global__ void push(double *x0, double *x1, double *v0, double *v1, int N, doub
     }
 }
 
+// kernel for calculating histogram bins for particle position
 __global__ void histogram(double *x, int *bins, int N, int Nbins)
 {
     extern __shared__ int local_bins[];
@@ -59,8 +63,6 @@ int main(int argc, char *argv[])
     int Nt = 2 << 8;
 
     // particle positions
-    double *x0 = new double[Np];
-    double *x1 = new double[Np];
     double *x0_h = new double[Np];
     double *x1_h = new double[Np];
     double *x0_d;
@@ -69,8 +71,6 @@ int main(int argc, char *argv[])
     cudaMalloc((void**)&x1_d, Np * sizeof(double));
     
     // particle velocities
-    double *v0 = new double[Np];
-    double *v1 = new double[Np];
     double *v0_h = new double[Np];
     double *v1_h = new double[Np];
     double *v0_d;
@@ -79,8 +79,6 @@ int main(int argc, char *argv[])
     cudaMalloc((void**)&v1_d, Np * sizeof(double));
 
     // density
-    int *bins0 = new int[Nbins];
-    int *bins1 = new int[Nbins];
     int *bins0_h = new int[Nbins];
     int *bins1_h = new int[Nbins];
     int *bins0_d;
@@ -94,43 +92,17 @@ int main(int argc, char *argv[])
     std::normal_distribution<> dist_x(0.5, 0.1);
     std::normal_distribution<> dist_v(1.0, 0.01);
     for (int i = 0; i < Np; ++i) {
-        x0[i] = dist_x(gen);
-        x0[i] = x0[i] - std::floor(x0[i]);
-        v0[i] = dist_v(gen);
-        x0_h[i] = x0[i];
-        v0_h[i] = v0[i];
+        x0_h[i] = dist_x(gen);
+        x0_h[i] = x0_h[i] - std::floor(x0_h[i]);
+        v0_h[i] = dist_v(gen);
     }
-
     cudaMemcpy(x0_d, x0_h, Np * sizeof(double), cudaMemcpyHostToDevice);
     cudaMemcpy(v0_d, v0_h, Np * sizeof(double), cudaMemcpyHostToDevice);
 
+    // open file for recording density data
     std::ofstream outfile("dens.csv");
 
-
-    if (false) {
-        for (int k = 0; k < Nt; ++k) {
-
-            for (int i = 0; i < Np; ++i) {
-                x1[i] = x0[i] + v0[i] * dt;
-                x1[i] = x1[i] - std::floor(x1[i]);
-                v1[i] = v0[i] * 1.01;
-            }
-
-            for (int i = 0; i < Nbins; ++i) {
-                bins1[i] = 0;
-            }
-            for (int i = 0; i < Np; ++i) {
-                int idx = static_cast<int>(std::floor(x1[i] * Nbins));
-                bins1[idx] += 1;
-            }
-
-            std::copy(x1, x1 + Np, x0);
-            std::copy(v1, v1 + Np, v0);
-            std::copy(bins1, bins1 + Nbins, bins0);
-        }
-    }
-
-
+    // main time loop
     for (int k = 0; k < Nt; ++k) {
         // push particles
         push<<<numBlocks, blockSize>>>(x0_d, x1_d, v0_d, v1_d, Np, dt);
