@@ -3,131 +3,181 @@
 #include <memory>
 #include <fstream>
 #include <chrono>
+#include <random>
+#include <utility>
+#include <string>
+#include <cstdlib>
+#include <algorithm>
 
-#include "../utils/utility.cuh"
-#include "fluid.cuh"
-
-void test_cpu(const FluidConfig &config, const Distribution &dist, int nt)
-{
-    std::cout << "Starting CPU test\n";
-    std::cout << "np=" << config.np << "; nx=" << config.ncells << "; nt=" << nt << "\n";
-
-    Fluid fluid(config);
-
-    fluid.m_ppos.allocate_h();
-    fluid.m_pvel.allocate_h();
-    fluid.m_dens.allocate_h();
-    fluid.m_pres.allocate_h();
-
-    fluid.init_particles_h(dist);
-
-    auto start = std::chrono::high_resolution_clock::now();
-
-    int k_steps = std::max<int>(1, (int)std::floor(nt / 10.));
-    for (int k = 0; k < nt; ++k)
-    {
-        fluid.update_momts_h();
-        fluid.update_fields_h();
-        fluid.push_particles_h();
-        
-        // print progress
-        if (k%k_steps == 0)
-        {
-            std::cout << (int)std::floor(double(k) * 100. / nt) << "% done\n";
-        }
+__global__ void push(double *x0, double *x1, double *v0, double *v1, int N, double dt) {
+    
+    int i = threadIdx.x + blockDim.x * blockIdx.x;
+    
+    for ( ; i < N; i += blockDim.x * gridDim.x) {
+        x1[i] = x0[i] + v0[i] * dt;
+        x1[i] = x1[i] - __double2int_rd(x1[i]);
+        v1[i] = v0[i] * 1.01;
     }
-
-    auto stop = std::chrono::high_resolution_clock::now();
-    auto duration_c = std::chrono::duration_cast<std::chrono::microseconds>(stop - start);
-    double duration = double(duration_c.count()) / 1000000.;
-    std::cout << "Finished CPU test\n";
-    std::cout << "Duration = " << duration << "s\n";
 }
 
-void test_gpu(const FluidConfig &config, const Distribution &dist, int nt)
+__global__ void histogram(double *x, int *bins, int N, int Nbins)
 {
-    std::cout << "Starting GPU test\n";
-    std::cout << "np=" << config.np << "; nx=" << config.ncells << "; nt=" << nt << "\n";
+    extern __shared__ int local_bins[];
 
-    Fluid fluid(config);
-
-    // allocate memory for cpu and gpu
-    fluid.m_ppos.allocate_h();
-    fluid.m_pvel.allocate_h();
-    fluid.m_dens.allocate_h();
-    fluid.m_pres.allocate_h();
-    fluid.m_ppos.allocate_d();
-    fluid.m_pvel.allocate_d();
-    fluid.m_dens.allocate_d();
-    fluid.m_pres.allocate_d();
-
-    // initialise the particle data on the gpu
-    fluid.init_particles_h(dist);
-
-    // move particle data to gpu and delete from cpu
-    fluid.m_ppos.cpy_h2d();
-    fluid.m_pvel.cpy_h2d();
-    fluid.m_ppos.free_h();
-    fluid.m_pvel.free_h();
-
-    auto start = std::chrono::high_resolution_clock::now();
-
-    int k_steps = std::max<int>(1, (int)std::floor(nt / 10.));
-    for (int k = 0; k < nt; ++k)
-    {
-        fluid.update_momts_d();
-
-        // send updated moments on gpu to cpu
-        // update fields on cpu then send to gpu for particle push
-        fluid.m_dens.cpy_d2h();
-        fluid.update_fields_h();
-        fluid.m_pres.cpy_h2d();
-        
-        fluid.push_particles_d();
-        
-        // print progress
-        if (k%k_steps == 0)
-        {
-            std::cout << (int)std::floor(double(k) * 100. / nt) << "% done\n";
-        }
+    if (threadIdx.x < Nbins) {
+        local_bins[threadIdx.x] = 0;
     }
 
-    auto stop = std::chrono::high_resolution_clock::now();
-    auto duration_c = std::chrono::duration_cast<std::chrono::microseconds>(stop - start);
-    double duration = double(duration_c.count()) / 1000000.;
-    std::cout << "Finished GPU test\n";
-    std::cout << "Duration = " << duration << "s\n";
+    __syncthreads();
+
+    int i = threadIdx.x + blockDim.x * blockIdx.x;
+
+    for ( ; i < N; i += blockDim.x * gridDim.x) {
+        int bin_idx = __double2int_rd(x[i] * Nbins);
+        atomicAdd(&local_bins[bin_idx], 1);
+    }
+
+    __syncthreads();
+
+    if (threadIdx.x < Nbins) {
+        atomicAdd(&bins[threadIdx.x], local_bins[threadIdx.x]);
+    }
+
 }
+
 
 int main(int argc, char *argv[])
 {
-/*
-    std::ofstream pos_os;
-    std::ofstream dns_os;
-    pos_os.open("pos.csv", std::ios::trunc);
-    dns_os.open("dns.csv", std::ios::trunc);
+    int blockSize = 256;
+    int numBlocks = 32;
 
-    pos_os.close();
-    dns_os.close();
-*/
-    int nt = 1<<10;
+    int Np = 2 << 16;
+    int Nbins = 32;
+    int sharedMemorySize = Nbins * sizeof(int);
 
-    FluidConfig config;
-    config.Lx = 1.0;
-    config.ncells = 1<<5;
-    config.np = 1<<20;
-    config.dt = 0.001;
-    config.mass = 1.;
-    config.complete();
+    double dt = 0.001;
+    int Nt = 2 << 8;
 
-    Distribution dist;
-    dist.vmin = -0.5;
-    dist.vmax = 0.5;
-    dist.nv = config.ncells;
-    int xdelta = 0.2;
-    int vdelta = 0.1;
-    dist.pmf = perturbed_pmf(config.ncells, dist.nv, 0., config.Lx, dist.vmin, dist.vmax, xdelta, vdelta);
+    // particle positions
+    double *x0 = new double[Np];
+    double *x1 = new double[Np];
+    double *x0_h = new double[Np];
+    double *x1_h = new double[Np];
+    double *x0_d;
+    double *x1_d;
+    cudaMalloc((void**)&x0_d, Np * sizeof(double));
+    cudaMalloc((void**)&x1_d, Np * sizeof(double));
+    
+    // particle velocities
+    double *v0 = new double[Np];
+    double *v1 = new double[Np];
+    double *v0_h = new double[Np];
+    double *v1_h = new double[Np];
+    double *v0_d;
+    double *v1_d;
+    cudaMalloc((void**)&v0_d, Np * sizeof(double));
+    cudaMalloc((void**)&v1_d, Np * sizeof(double));
 
-    test_cpu(config, dist, nt);
+    // density
+    int *bins0 = new int[Nbins];
+    int *bins1 = new int[Nbins];
+    int *bins0_h = new int[Nbins];
+    int *bins1_h = new int[Nbins];
+    int *bins0_d;
+    int *bins1_d;
+    cudaMalloc((void**)&bins0_d, Nbins * sizeof(int));
+    cudaMalloc((void**)&bins1_d, Nbins * sizeof(int));
 
+    // initialise position and velocity of particles
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::normal_distribution<> dist_x(0.5, 0.1);
+    std::normal_distribution<> dist_v(1.0, 0.01);
+    for (int i = 0; i < Np; ++i) {
+        x0[i] = dist_x(gen);
+        x0[i] = x0[i] - std::floor(x0[i]);
+        v0[i] = dist_v(gen);
+        x0_h[i] = x0[i];
+        v0_h[i] = v0[i];
+    }
+
+    cudaMemcpy(x0_d, x0_h, Np * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(v0_d, v0_h, Np * sizeof(double), cudaMemcpyHostToDevice);
+
+    std::ofstream outfile("dens.csv");
+
+
+    if (false) {
+        for (int k = 0; k < Nt; ++k) {
+
+            for (int i = 0; i < Np; ++i) {
+                x1[i] = x0[i] + v0[i] * dt;
+                x1[i] = x1[i] - std::floor(x1[i]);
+                v1[i] = v0[i] * 1.01;
+            }
+
+            for (int i = 0; i < Nbins; ++i) {
+                bins1[i] = 0;
+            }
+            for (int i = 0; i < Np; ++i) {
+                int idx = static_cast<int>(std::floor(x1[i] * Nbins));
+                bins1[idx] += 1;
+            }
+
+            std::copy(x1, x1 + Np, x0);
+            std::copy(v1, v1 + Np, v0);
+            std::copy(bins1, bins1 + Nbins, bins0);
+        }
+    }
+
+
+    for (int k = 0; k < Nt; ++k) {
+        // push particles
+        push<<<numBlocks, blockSize>>>(x0_d, x1_d, v0_d, v1_d, Np, dt);
+
+        // intialise bins at t=k+1 to be empty
+        for (int i = 0; i < Nbins; ++i) {
+            bins1_h[i] = 0;
+        }
+        cudaMemcpy(bins1_d, bins1_h, Nbins * sizeof(int), cudaMemcpyHostToDevice); 
+
+        // get density
+        histogram<<<numBlocks, blockSize, sharedMemorySize>>>(x1_d, bins1_d, Np, Nbins);
+        
+        // record density
+        cudaMemcpy(bins1_h, bins1_d, Nbins * sizeof(int), cudaMemcpyDeviceToHost);
+        if (outfile.is_open()) {
+            for (int i = 0; i < Nbins; ++i) {
+                outfile << bins1_h[i];
+                if (i < Nbins - 1) {
+                    outfile << ",";
+                }
+            }            
+            if (k < Nt - 1) {
+                outfile << "\n";
+            }
+        }
+
+        // transfer data at k+1 to k
+        // previously copied memory on the device from k+1 -> k but instead choosing to swap pointers
+        //cudaMemcpy(x0_d, x1_d, Np * sizeof(double), cudaMemcpyDeviceToDevice);
+        //cudaMemcpy(v0_d, v1_d, Np * sizeof(double), cudaMemcpyDeviceToDevice);
+        //cudaMemcpy(bins0_d, bins1_d, Nbins * sizeof(int), cudaMemcpyDeviceToDevice);
+
+        double *tmp_ptr;
+
+        tmp_ptr = x0_d;
+        x0_d = x1_d;
+        x1_d = tmp_ptr;
+
+        tmp_ptr = v0_d;
+        v0_d = v1_d;
+        v1_d = tmp_ptr;
+
+        int *tmp_ptr2;
+        tmp_ptr2 = bins0_d;
+        bins0_d = bins1_d;
+        bins1_d = tmp_ptr2;
+
+    }
 }
